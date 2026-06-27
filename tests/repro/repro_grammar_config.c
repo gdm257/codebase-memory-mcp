@@ -908,17 +908,29 @@ TEST(repro_grammar_config_jsonnet) {
  */
 TEST(repro_grammar_config_starlark) {
     /* All calls must live INSIDE a function body for callable-sourcing (dim 7):
-     * go_binary is called inside make_binary's body, so its CALLS edge sources at
+     * both calls are inside make_binary's body, so their CALLS edges source at
      * the make_binary Function. The module-level statement only REFERENCES
      * make_binary (a bare name assignment, not a call) so there is no
-     * Module-level call site. */
+     * Module-level call site.
+     *
+     * Callable-sourcing (dim 7) counts CALLS *edges* in the graph, and pass_calls
+     * only emits a CALLS edge when the callee resolves to a node in the file
+     * (an unresolved external callee yields no edge — pass_calls.c:389). The
+     * go_binary(...) call satisfies the dim-6 calls-extracted assertion (the
+     * "go_binary" callee string is extracted), but go_binary is an external rule
+     * with no def here, so it produces no edge. _base_deps() is defined in this
+     * same file, so the in-body call to it resolves to a Function node and gives
+     * dim 7 a Function-sourced edge to attribute. */
     static const char src[] =
+        "def _base_deps():\n"
+        "    return [\"//internal/cbm\"]\n"
+        "\n"
         "def make_binary(name, srcs, deps = []):\n"
         "    \"\"\"Wrapper around go_binary for internal defaults.\"\"\"\n"
         "    go_binary(\n"
         "        name = name,\n"
         "        srcs = srcs,\n"
-        "        deps = deps + [\"//internal/cbm\"],\n"
+        "        deps = deps + _base_deps(),\n"
         "    )\n"
         "\n"
         "default_rule = make_binary\n";

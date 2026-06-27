@@ -87,12 +87,124 @@ static const char *compute_wolfram_func_qn(CBMExtractCtx *ctx, TSNode node) {
     return NULL;
 }
 
+/* True for a Lisp def-form head symbol (defn/define/...). Mirrors
+ * lisp_is_def_head() in extract_defs.c so the scope-stack walk pushes a
+ * SCOPE_FUNC only for actual definitions, never for a plain call list such as
+ * `(add x 1)` — otherwise every parenthesized form would shadow the enclosing
+ * def and the in-body call would mis-source. */
+static bool lisp_head_is_def(const char *t) {
+    if (!t) {
+        return false;
+    }
+    static const char *heads[] = {
+        "defn",          "defn-",          "def",
+        "defmacro",      "defmulti",       "defmethod",
+        "defprotocol",   "defrecord",      "deftype",
+        "definterface",  "defonce",        "define",
+        "define-syntax", "define-values",  "define-syntax-rule",
+        "define-struct", "define-record-type", "define/contract",
+        "struct",        NULL};
+    for (int i = 0; heads[i]; i++) {
+        if (strcmp(t, heads[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Resolve a Lisp (Clojure/Scheme/Racket) def-form's QN for scope tracking.
+ * The def node is a list/list_lit whose head names the def kind and whose
+ * second element is the name (a bare symbol) or a (name args...) nested list.
+ * Returns NULL for any non-def list (calls, vectors of args, the +/- body
+ * forms, ...), so push_boundary_scopes pushes no scope for them. Mirrors
+ * extract_lisp_def() in extract_defs.c. */
+static const char *compute_lisp_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_named_child_count(node) < 2) {
+        return NULL;
+    }
+    char *head = cbm_node_text(ctx->arena, ts_node_named_child(node, 0), ctx->source);
+    if (!lisp_head_is_def(head)) {
+        return NULL;
+    }
+    TSNode target = ts_node_named_child(node, 1);
+    const char *tk = ts_node_type(target);
+    TSNode name_node = target;
+    /* (define (foo args) ...) — the name is the head symbol of the nested list. */
+    if ((strcmp(tk, "list") == 0 || strcmp(tk, "list_lit") == 0) &&
+        ts_node_named_child_count(target) > 0) {
+        name_node = ts_node_named_child(target, 0);
+    }
+    if (ts_node_is_null(name_node)) {
+        return NULL;
+    }
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+}
+
+/* Resolve an Elixir def/defp/defmacro's QN for scope tracking. The def is a
+ * `call` node whose target (first child) is the def macro and whose first
+ * argument is either the function head call `name(args)` or a bare identifier
+ * (zero-arg). Returns NULL for a non-def `call` (e.g. the in-body `add(x,1)`
+ * call, whose target is not a def macro) so only defs push a scope. Mirrors
+ * extract_elixir_func_def() in extract_defs.c. */
+static const char *compute_elixir_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_child_count(node) == 0) {
+        return NULL;
+    }
+    char *macro = cbm_node_text(ctx->arena, ts_node_child(node, 0), ctx->source);
+    if (!macro || (strcmp(macro, "def") != 0 && strcmp(macro, "defp") != 0 &&
+                   strcmp(macro, "defmacro") != 0)) {
+        return NULL;
+    }
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) && ts_node_child_count(node) > 1) {
+        args = ts_node_child(node, 1);
+    }
+    if (ts_node_is_null(args) || ts_node_child_count(args) == 0) {
+        return NULL;
+    }
+    TSNode first_arg = ts_node_child(args, 0);
+    if (ts_node_is_null(first_arg)) {
+        return NULL;
+    }
+    const char *fk = ts_node_type(first_arg);
+    char *name = NULL;
+    if (strcmp(fk, "call") == 0 && ts_node_child_count(first_arg) > 0) {
+        name = cbm_node_text(ctx->arena, ts_node_child(first_arg, 0), ctx->source);
+    } else if (strcmp(fk, "identifier") == 0) {
+        name = cbm_node_text(ctx->arena, first_arg, ctx->source);
+    }
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+}
+
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
 static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                    WalkState *state) {
     (void)spec;
     if (ctx->language == CBM_LANG_WOLFRAM) {
         return compute_wolfram_func_qn(ctx, node);
+    }
+
+    /* Lisp family (Clojure/Scheme/Racket): the def node is a list/list_lit, a
+     * very general kind that also matches plain call forms. The shared resolver
+     * has no source pointer to read the head symbol, so the def-vs-call gate
+     * lives here (we have ctx->source). Non-def lists return NULL → no scope
+     * pushed → the in-body call sources to the enclosing def, not the Module. */
+    if (ctx->language == CBM_LANG_CLOJURE || ctx->language == CBM_LANG_SCHEME ||
+        ctx->language == CBM_LANG_RACKET) {
+        return compute_lisp_func_qn(ctx, node);
+    }
+
+    /* Elixir: def/defp/defmacro are `call` nodes (so is every in-body call).
+     * Gate on the def-macro target text so only definitions push a scope. */
+    if (ctx->language == CBM_LANG_ELIXIR) {
+        return compute_elixir_func_qn(ctx, node);
     }
 
     /* Resolve the function name via the single shared resolver (extract_defs) so

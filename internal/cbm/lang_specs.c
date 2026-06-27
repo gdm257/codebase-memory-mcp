@@ -694,6 +694,10 @@ static const char *r_env_funcs[] = {"Sys.getenv", NULL};
 static const char *perl_env_funcs[] = {"$ENV", NULL};
 
 // ==================== CLOJURE ====================
+/* Clojure def-forms (defn/def/...) are `list_lit` nodes; gating the actual
+ * def-vs-call distinction happens in cbm_resolve_func_name (returns NULL for a
+ * non-def list_lit such as a call), so non-def lists never push a SCOPE_FUNC. */
+static const char *clojure_func_types[] = {"list_lit", NULL};
 static const char *clojure_module_types[] = {"source", NULL};
 static const char *clojure_call_types[] = {"list_lit", NULL};
 
@@ -1056,6 +1060,9 @@ static const char *pascal_assign_types[] = {"assignment", NULL};
 static const char *pascal_throw_types[] = {"raise", NULL};
 static const char *pascal_module_types[] = {"source_file", NULL};
 static const char *d_module_types[] = {"source_file", NULL};
+/* Scheme def-forms (`(define (f ..) ..)`) are `list` nodes; the def-vs-call
+ * gate is in cbm_resolve_func_name (returns NULL for a non-def list). */
+static const char *scheme_func_types[] = {"list", NULL};
 static const char *scheme_call_types[] = {"list", NULL};
 static const char *scheme_var_types[] = {"symbol", NULL};
 static const char *scheme_module_types[] = {"program", NULL};
@@ -1125,6 +1132,9 @@ static const char *agda_branch_types[] = {"lambda", "match", "do", NULL};
 static const char *agda_var_types[] = {"typed_binding", NULL};
 static const char *agda_module_types[] = {"source_file", NULL};
 static const char *racket_class_types[] = {"structure", NULL};
+/* Racket def-forms (`(define (f ..) ..)`) are `list` nodes; the def-vs-call
+ * gate is in cbm_resolve_func_name (returns NULL for a non-def list). */
+static const char *racket_func_types[] = {"list", NULL};
 static const char *racket_call_types[] = {"list", NULL};
 static const char *racket_var_types[] = {"symbol", NULL};
 static const char *racket_module_types[] = {"program", NULL};
@@ -1794,7 +1804,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                              empty_types, NULL, NULL, tree_sitter_dockerfile, NULL},
 
     // CBM_LANG_CLOJURE
-    [CBM_LANG_CLOJURE] = {CBM_LANG_CLOJURE, empty_types, empty_types, empty_types,
+    [CBM_LANG_CLOJURE] = {CBM_LANG_CLOJURE, clojure_func_types, empty_types, empty_types,
                           clojure_module_types, clojure_call_types, empty_types, empty_types,
                           empty_types, empty_types, empty_types, empty_types, NULL, empty_types,
                           NULL, NULL, tree_sitter_clojure, NULL},
@@ -2037,7 +2047,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                         NULL},
 
     // CBM_LANG_SCHEME
-    [CBM_LANG_SCHEME] = {CBM_LANG_SCHEME, empty_types, empty_types, empty_types,
+    [CBM_LANG_SCHEME] = {CBM_LANG_SCHEME, scheme_func_types, empty_types, empty_types,
                          scheme_module_types, scheme_call_types, empty_types, empty_types,
                          empty_types, scheme_var_types, empty_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_scheme, NULL},
@@ -2085,7 +2095,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        empty_types, NULL, NULL, tree_sitter_agda, NULL},
 
     // CBM_LANG_RACKET
-    [CBM_LANG_RACKET] = {CBM_LANG_RACKET, empty_types, racket_class_types, empty_types,
+    [CBM_LANG_RACKET] = {CBM_LANG_RACKET, racket_func_types, racket_class_types, empty_types,
                          racket_module_types, racket_call_types, empty_types, empty_types,
                          empty_types, racket_var_types, empty_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_racket, NULL},
