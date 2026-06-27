@@ -3120,11 +3120,24 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
+        /* Choose the hook target: if ~/.codex/hooks.json already exists, the
+         * user manages Codex hooks via the JSON representation — write the
+         * SessionStart reminder there instead of config.toml. Writing both
+         * makes Codex warn about loading hooks from two representations (#570).
+         * config.toml remains the mcp_config target above either way. */
+        char hooks_json[CLI_BUF_1K];
+        snprintf(hooks_json, sizeof(hooks_json), "%s/.codex/hooks.json", home);
+        bool use_hooks_json = cbm_file_exists(hooks_json);
+        const char *hook_target = use_hooks_json ? hooks_json : cp;
         if (g_install_plan) {
-            plan_record("Codex CLI", "hook", cp);
+            plan_record("Codex CLI", "hook", hook_target);
         } else {
             if (!dry_run) {
-                cbm_upsert_codex_hooks(cp);
+                if (use_hooks_json) {
+                    cbm_upsert_gemini_session_hooks(hooks_json);
+                } else {
+                    cbm_upsert_codex_hooks(cp);
+                }
             }
             printf("  hooks: SessionStart (codebase-memory-mcp reminder)\n");
         }
@@ -3183,6 +3196,36 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
     }
 }
 
+/* Scan Code/User/profiles/ and install (or plan) a per-profile mcp.json for
+ * each existing profile subdirectory, so VS Code profile users inherit the MCP
+ * server without manual steps (#431). No-op when profiles/ is absent. */
+static void install_vscode_profile_configs(const char *code_user, const char *binary_path,
+                                           bool dry_run) {
+    char profiles_dir[CLI_BUF_1K];
+    snprintf(profiles_dir, sizeof(profiles_dir), "%s/profiles", code_user);
+    cbm_dir_t *d = cbm_opendir(profiles_dir);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, ".") == 0 || strcmp(ent->name, "..") == 0) {
+            continue;
+        }
+        char profile_path[CLI_BUF_1K];
+        snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
+        struct stat st;
+        if (stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/mcp.json", profile_path);
+        install_generic_agent_config("VS Code", binary_path, cp, NULL, dry_run,
+                                     cbm_install_vscode_mcp);
+    }
+    cbm_closedir(d);
+}
+
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
 static void install_editor_agent_configs(const cbm_detected_agents_t *agents, const char *home,
                                          const char *binary_path, bool dry_run) {
@@ -3215,14 +3258,21 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
                                      cbm_install_editor_mcp);
     }
     if (agents->vscode) {
-        char cp[CLI_BUF_1K];
+        char code_user[CLI_BUF_1K];
 #ifdef __APPLE__
-        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Code/User/mcp.json", home);
+        snprintf(code_user, sizeof(code_user), "%s/Library/Application Support/Code/User", home);
 #else
-        snprintf(cp, sizeof(cp), "%s/Code/User/mcp.json", cbm_app_config_dir());
+        snprintf(code_user, sizeof(code_user), "%s/Code/User", cbm_app_config_dir());
 #endif
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/mcp.json", code_user);
         install_generic_agent_config("VS Code", binary_path, cp, NULL, dry_run,
                                      cbm_install_vscode_mcp);
+        /* VS Code profiles each keep their own settings under
+         * Code/User/profiles/<id>/. The default mcp.json above does NOT apply
+         * to a named profile, so write/plan a per-profile mcp.json for every
+         * existing profile directory (#431). */
+        install_vscode_profile_configs(code_user, binary_path, dry_run);
     }
     if (agents->cursor) {
         char cp[CLI_BUF_1K];

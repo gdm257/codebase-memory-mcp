@@ -331,21 +331,43 @@ char *cbm_project_name_from_path(const char *abs_path) {
     /* Normalize path separators */
     cbm_normalize_path_sep(path);
 
-    /* Map every character cbm_validate_project_name would reject to '-'. The
+    /* Map every character cbm_validate_project_name would reject. The
      * validator (used by resolve_store via project_db_path) allows only
      * [A-Za-z0-9._-], so anything else — path separators, ':', spaces, '@',
-     * '+', unicode bytes, … — must be normalized here. Otherwise a repo like
+     * '+', … — must be normalized here. Otherwise a repo like
      * "/home/u/my project" yields the name "home-u-my project": indexing
      * creates the DB and it shows in list_projects, but resolve_store rejects
-     * the space and reports project-not-found (#349). */
+     * the space and reports project-not-found (#349).
+     *
+     * Non-ASCII bytes (UTF-8 of CJK and other scripts, all >= 0x80) are NOT
+     * dropped to '-' — that silently erased whole path segments and produced
+     * unrecognizable / colliding names (#571). Instead each non-ASCII byte is
+     * transliterated to its two lowercase hex digits, which use only [0-9a-f]
+     * and therefore stay validator-safe while preserving the segment. */
+    static const char hex_digits[] = "0123456789abcdef";
+    char *mapped = malloc(len * 2 + 1); /* worst case: every byte → 2 hex chars */
+    if (!mapped) {
+        free(path);
+        return strdup("root");
+    }
+    size_t mlen = 0;
     for (size_t i = 0; i < len; i++) {
         unsigned char c = (unsigned char)path[i];
         bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                     c == '.' || c == '_' || c == '-';
-        if (!safe) {
-            path[i] = '-';
+        if (safe) {
+            mapped[mlen++] = (char)c;
+        } else if (c >= 0x80) {
+            mapped[mlen++] = hex_digits[(c >> 4) & 0xF];
+            mapped[mlen++] = hex_digits[c & 0xF];
+        } else {
+            mapped[mlen++] = '-';
         }
     }
+    mapped[mlen] = '\0';
+    free(path);
+    path = mapped;
+    len = mlen;
 
     /* Collapse consecutive dashes, and consecutive dots (the validator also
      * rejects any ".." sequence). */

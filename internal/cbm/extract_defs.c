@@ -465,7 +465,7 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
 // or NULL when the declarator is unqualified (a plain free function). Without
 // this, an out-of-line definition — whose class body lives declaration-only in a
 // header — would be recorded as a free Function with no link to its class.
-static char *cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source) {
+char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source) {
     // Descend the declarator chain to its qualified_identifier, if any.
     TSNode qid = {0};
     TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
@@ -608,8 +608,16 @@ static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
         return null_node;
     }
     const char *pk = ts_node_type(parent);
-    if (strcmp(pk, "variable_declarator") == 0) {
+    if (strcmp(pk, "variable_declarator") == 0 ||
+        strcmp(pk, "public_field_definition") == 0) {
+        /* `const f = () => {}` and the class-field form `f = () => {}` both name
+         * the arrow via the parent's `name` child (#new_ts_class_field_arrow):
+         * resolving it lets push_boundary_scopes push a SCOPE_FUNC so in-body
+         * calls source to the method, not the enclosing class/module. */
         return ts_node_child_by_field_name(parent, TS_FIELD("name"));
+    }
+    if (strcmp(pk, "field_definition") == 0) {
+        return ts_node_child_by_field_name(parent, TS_FIELD("property"));
     }
     if (strcmp(pk, "pair") == 0) {
         return ts_node_child_by_field_name(parent, TS_FIELD("key"));
@@ -1642,6 +1650,38 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     }
     result[idx] = NULL;
     return result;
+}
+
+/* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
+ * attributes both parse as distinct function_item nodes and otherwise receive
+ * the SAME qualified_name, so the second graph upsert silently overwrites the
+ * first and one branch is lost (#495). Fold the cfg predicate into the QN so
+ * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
+ * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
+static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
+                                           const char *const *decorators) {
+    if (!decorators) {
+        return base_qn;
+    }
+    for (int i = 0; decorators[i]; i++) {
+        const char *cfg = strstr(decorators[i], "cfg(");
+        if (!cfg) {
+            continue;
+        }
+        /* Build a compact predicate suffix from the cfg(...) text, dropping
+         * whitespace and quotes so the QN stays readable and stable. */
+        char buf[CBM_SZ_256];
+        size_t bi = 0;
+        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
+            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
+                continue;
+            }
+            buf[bi++] = *p;
+        }
+        buf[bi] = '\0';
+        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
+    }
+    return base_qn;
 }
 
 // Extract base class name text from a single base_class child node.
@@ -2883,7 +2923,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // class node QN computed the same way) so DEFINES_METHOD edges resolve.
     if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
         strcmp(ts_node_type(node), "function_definition") == 0) {
-        char *scope_name = cpp_out_of_line_parent_class(a, node, ctx->source);
+        char *scope_name = cbm_cpp_out_of_line_parent_class(a, node, ctx->source);
         if (scope_name && scope_name[0]) {
             const char *class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, scope_name);
             def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
@@ -2917,6 +2957,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+
+    // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
+    // predicate into the QN so both branches survive the graph upsert (#495).
+    if (ctx->language == CBM_LANG_RUST) {
+        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+    }
 
     // Docstring
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
@@ -3868,6 +3914,24 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             method_node = def;
         }
 
+        // TS/JS class-field arrow functions: `handleClick = () => {...}` is a
+        // public_field_definition whose `value` is an arrow_function (a common
+        // React event-handler pattern). It is not in function_node_types, so it
+        // would otherwise be dropped. Peek through to the inner arrow and take
+        // the method name from the field's `name` child (#new_ts_class_field_arrow).
+        if (strcmp(ts_node_type(child), "public_field_definition") == 0) {
+            TSNode value = ts_node_child_by_field_name(child, TS_FIELD("value"));
+            if (ts_node_is_null(value) || !cbm_kind_in_set(value, spec->function_node_types)) {
+                continue;
+            }
+            TSNode fname = ts_node_child_by_field_name(child, TS_FIELD("name"));
+            if (ts_node_is_null(fname)) {
+                continue;
+            }
+            push_method_def(ctx, value, class_qn, spec, fname);
+            continue;
+        }
+
         if (!cbm_kind_in_set(method_node, spec->function_node_types)) {
             continue;
         }
@@ -4318,8 +4382,23 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     switch (ctx->language) {
     case CBM_LANG_PYTHON: {
         TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
-        if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "identifier") == 0) {
+        if (ts_node_is_null(left)) {
+            break;
+        }
+        const char *lt = ts_node_type(left);
+        if (strcmp(lt, "identifier") == 0) {
             push_var_def(ctx, cbm_node_text(a, left, ctx->source), node);
+        } else if (strcmp(lt, "pattern_list") == 0 || strcmp(lt, "tuple_pattern") == 0 ||
+                   strcmp(lt, "list_pattern") == 0) {
+            /* Tuple/list unpacking: `x, y = f()` — emit a Variable def for each
+             * unpacked identifier on the LHS (#new_py_tuple_unpack). */
+            uint32_t ln = ts_node_named_child_count(left);
+            for (uint32_t li = 0; li < ln; li++) {
+                TSNode part = ts_node_named_child(left, li);
+                if (strcmp(ts_node_type(part), "identifier") == 0) {
+                    push_var_def(ctx, cbm_node_text(a, part, ctx->source), node);
+                }
+            }
         }
         break;
     }

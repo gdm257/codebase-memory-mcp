@@ -308,6 +308,22 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return NULL;
     }
 
+    /* C++/CUDA out-of-line method `void Foo::bar() {...}`: the def extractor
+     * records this as Method "proj.file.Foo.bar". The call-scope QN must match
+     * (be class-qualified) so an in-body call sources to the method, not a bare
+     * "proj.file.bar" that no node carries (#554/#621). The out-of-line def is at
+     * file scope, so enclosing_class_qn is NULL — derive the class from the
+     * qualified declarator instead. */
+    if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
+        strcmp(ts_node_type(node), "function_definition") == 0) {
+        char *scope_name = cbm_cpp_out_of_line_parent_class(ctx->arena, node, ctx->source);
+        if (scope_name && scope_name[0]) {
+            const char *class_qn =
+                cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, scope_name);
+            return cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
+        }
+    }
+
     if (state->enclosing_class_qn) {
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }

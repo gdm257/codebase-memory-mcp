@@ -59,6 +59,13 @@ TSNode cbm_resolve_c_declarator_name_node(TSNode func_node);
 // gap #3 (and #438 for the C-declarator case).
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 
+// C++/CUDA out-of-line method definition (`void Foo::bar() {...}`): return the
+// immediate enclosing class name ("Foo") from the qualified declarator, or NULL
+// for a plain free function. Defined in extract_defs.c. Shared so the unified
+// (call-scope) extractor computes the SAME class-qualified enclosing QN as the
+// def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
+char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 

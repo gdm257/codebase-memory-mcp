@@ -1866,6 +1866,23 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         if (!target_node || source_node->id == target_node->id) {
+            /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
+             * resolve to an unindexed QN (target_node == NULL), but their edge
+             * target is a synthesized route node, not the library — emit them
+             * anyway so cross-repo matching has an HTTP_CALLS edge to work with
+             * (#523). Mirrors the sequential resolve_single_call bypass. */
+            cbm_svc_kind_t psvc = cbm_service_pattern_match(res.qualified_name);
+            if ((psvc == CBM_SVC_HTTP || psvc == CBM_SVC_ASYNC) && !target_node) {
+                const char *u = call->first_string_arg;
+                bool url_or_topic = u && u[0] != '\0' &&
+                                    (u[0] == '/' || strstr(u, "://") != NULL ||
+                                     (psvc == CBM_SVC_ASYNC && strlen(u) > PP_ESC_SPACE));
+                if (url_or_topic) {
+                    emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
+                                      rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                    ws->calls_resolved++;
+                }
+            }
             continue;
         }
         _rc_t0 = extract_now_ns();

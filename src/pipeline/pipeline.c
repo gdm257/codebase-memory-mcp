@@ -491,9 +491,35 @@ static bool is_infra_file(const char *fp) {
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
 }
 
+/* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
+ * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
+ * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
+ * curl targets) are NOT routes the service serves and must not mint Route nodes
+ * (#521). Exposed-endpoint keys (push_endpoint, post_url, callback, webhook)
+ * are intentionally absent here so they still produce infra Route nodes. */
+static bool is_upstream_config_key(const char *key_path) {
+    if (!key_path) {
+        /* No key context (e.g. flat string) — keep prior behaviour and mint. */
+        return false;
+    }
+    static const char *const deny[] = {"jwks",       "registry",  "registries",
+                                       "healthcheck", "upstream",  "_service_url",
+                                       "auth",        NULL};
+    for (int i = 0; deny[i]; i++) {
+        if (strstr(key_path, deny[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Try to create an infra Route node from one string_ref. */
 static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, const char *fp) {
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+        return;
+    }
+    /* Skip upstream/config/healthcheck URLs — they are not exposed routes (#521). */
+    if (is_upstream_config_key(sr->key_path)) {
         return;
     }
     char route_qn[CBM_ROUTE_QN_SIZE];

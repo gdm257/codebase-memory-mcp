@@ -250,6 +250,53 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
  * to CALLS: route/config edge props feed full-only predump passes
  * (create_route_nodes/create_data_flows), so altering them desyncs full vs
  * incremental indexing. */
+/* Append a ,"args":[{"i":0,"e":"<expr>","v":"<value>"},...] field onto a CALLS
+ * edge's JSON props (the props buffer ends in '}'). The sequential pass omitted
+ * this, so data_flow mode had no argument expressions to surface for small
+ * (< 50 file) repos that take the sequential path (#514). Mirrors the parallel
+ * path's append_args_json shape so both pipelines agree. */
+static void calls_append_args(char *props, size_t cap, const CBMCall *call) {
+    if (!call || call->arg_count <= 0) {
+        return;
+    }
+    size_t len = strlen(props);
+    if (len < SKIP_ONE || props[len - SKIP_ONE] != '}') {
+        return;
+    }
+    /* Overwrite the trailing '}' and rebuild it after the args array. */
+    size_t pos = len - SKIP_ONE;
+    int n = snprintf(props + pos, cap - pos, ",\"args\":[");
+    if (n <= 0 || (size_t)n >= cap - pos) {
+        return;
+    }
+    pos += (size_t)n;
+    for (int i = 0; i < call->arg_count; i++) {
+        const CBMCallArg *a = &call->args[i];
+        char esc_e[CBM_SZ_256];
+        cbm_json_escape(esc_e, sizeof(esc_e), a->expr ? a->expr : "");
+        char one[CBM_SZ_512];
+        if (a->value) {
+            char esc_v[CBM_SZ_256];
+            cbm_json_escape(esc_v, sizeof(esc_v), a->value);
+            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\",\"v\":\"%s\"}",
+                         i > 0 ? "," : "", a->index, esc_e, esc_v);
+        } else {
+            n = snprintf(one, sizeof(one), "%s{\"i\":%d,\"e\":\"%s\"}", i > 0 ? "," : "", a->index,
+                         esc_e);
+        }
+        if (n <= 0 || (size_t)n >= cap - pos - PAIR_LEN) {
+            break; /* not enough room — close the array with what fits */
+        }
+        memcpy(props + pos, one, (size_t)n);
+        pos += (size_t)n;
+    }
+    if (pos + PAIR_LEN < cap) {
+        props[pos++] = ']';
+        props[pos++] = '}';
+        props[pos] = '\0';
+    }
+}
+
 static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
                             char *props, size_t cap, const CBMCall *call) {
     if (call && call->start_line > 0 && strcmp(type, "CALLS") == 0) {
@@ -258,6 +305,9 @@ static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const ch
             snprintf(props + len - SKIP_ONE, cap - (len - SKIP_ONE), ",\"line\":%d}",
                      call->start_line);
         }
+    }
+    if (call && strcmp(type, "CALLS") == 0) {
+        calls_append_args(props, cap, call);
     }
     cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
 }
@@ -402,6 +452,27 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                         res.strategy)) {
         return 0;
     }
+
+    /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
+     * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
+     * name ("requests"), but that library is not in the indexed tree so
+     * cbm_gbuf_find_by_qn returns NULL. The edge target for such calls is a
+     * SYNTHESIZED route node (create_svc_route_node), not the library node, so
+     * the missing target must NOT drop the call — otherwise no HTTP_CALLS edge
+     * is written and cross-repo matching finds nothing (#523). Emit directly
+     * when the call carries a URL/topic first argument. */
+    cbm_svc_kind_t svc = cbm_service_pattern_match(res.qualified_name);
+    if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
+        const char *u = call->first_string_arg;
+        bool has_url_or_topic =
+            u && u[0] != '\0' &&
+            (u[0] == '/' || strstr(u, "://") != NULL || (svc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN));
+        if (has_url_or_topic) {
+            emit_http_async_edge(ctx, call, source_node, NULL, &res, svc);
+            return SKIP_ONE;
+        }
+    }
+
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     if (!target_node || source_node->id == target_node->id) {
         return 0;
