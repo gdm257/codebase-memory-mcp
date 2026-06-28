@@ -422,9 +422,8 @@ TEST(server_handle_logs_request_without_params) {
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     char *resp =
-        cbm_mcp_server_handle(srv,
-                              "{\"jsonrpc\":\"2.0\",\"id\":210,\"method\":\"tools/list\","
-                              "\"params\":{\"token\":\"secret\"}}");
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":210,\"method\":\"tools/list\","
+                                   "\"params\":{\"token\":\"secret\"}}");
     ASSERT_NOT_NULL(resp);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -433,8 +432,8 @@ TEST(server_handle_logs_request_without_params) {
     cbm_log_set_level(prev_level);
 
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request"));
-    ASSERT_NOT_NULL(strstr(mcp_log_buf, "rpc.system=jsonrpc"));
-    ASSERT_NOT_NULL(strstr(mcp_log_buf, "rpc.method=tools/list"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "protocol=jsonrpc"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=tools/list"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
     ASSERT_NULL(strstr(mcp_log_buf, "token"));
     ASSERT_NULL(strstr(mcp_log_buf, "secret"));

@@ -111,21 +111,6 @@ static const char *level_str(CBMLogLevel level) {
     }
 }
 
-static const char *severity_str(CBMLogLevel level) {
-    switch (level) {
-    case CBM_LOG_DEBUG:
-        return "DEBUG";
-    case CBM_LOG_INFO:
-        return "INFO";
-    case CBM_LOG_WARN:
-        return "WARNING";
-    case CBM_LOG_ERROR:
-        return "ERROR";
-    default:
-        return "DEFAULT";
-    }
-}
-
 static void append_char(char *buf, size_t bufsz, size_t *pos, char ch) {
     if (*pos < bufsz - 1) {
         buf[*pos] = ch;
@@ -231,10 +216,8 @@ void cbm_log(CBMLogLevel level, const char *msg, ...) {
     va_start(args, msg);
 
     if (g_log_format == CBM_LOG_FORMAT_JSON) {
-        append_raw(line_buf, sizeof(line_buf), &pos, "{\"severity\":");
-        append_json_string(line_buf, sizeof(line_buf), &pos, severity_str(level));
-        append_raw(line_buf, sizeof(line_buf), &pos, ",\"message\":");
-        append_json_string(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
+        append_raw(line_buf, sizeof(line_buf), &pos, "{\"level\":");
+        append_json_string(line_buf, sizeof(line_buf), &pos, level_str(level));
         append_raw(line_buf, sizeof(line_buf), &pos, ",\"event\":");
         append_json_string(line_buf, sizeof(line_buf), &pos, msg ? msg : "");
         for (;;) {
@@ -299,13 +282,13 @@ void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_erro
     char duration_ms[CBM_SZ_32];
     snprintf(duration_ms, sizeof(duration_ms), "%" PRId64, duration_us / 1000);
     if (tool_name && tool_name[0] != '\0') {
-        cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "rpc.system", "jsonrpc",
-                "rpc.method", method ? method : "", "mcp.tool.name", tool_name, "status",
+        cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
+                "method", method ? method : "", "tool", tool_name, "status",
                 is_error ? "error" : "ok", "duration_ms", duration_ms, NULL);
     } else {
-        cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "rpc.system", "jsonrpc",
-                "rpc.method", method ? method : "", "status", is_error ? "error" : "ok",
-                "duration_ms", duration_ms, NULL);
+        cbm_log(is_error ? CBM_LOG_WARN : CBM_LOG_INFO, "mcp.request", "protocol", "jsonrpc",
+                "method", method ? method : "", "status", is_error ? "error" : "ok", "duration_ms",
+                duration_ms, NULL);
     }
 }
 
@@ -329,8 +312,7 @@ void cbm_log_http_request(const char *component, const char *method, const char 
         level = CBM_LOG_WARN;
     }
 
-    cbm_log(level, "http.request", "component", component ? component : "", "http.request.method",
-            method ? method : "", "url.path", safe_path, "http.response.status_code", status_buf,
-            "duration_ms", duration_buf, "http.request.body.size", request_buf,
-            "http.response.body.size", response_buf, NULL);
+    cbm_log(level, "http.request", "component", component ? component : "", "method",
+            method ? method : "", "path", safe_path, "status", status_buf, "duration_ms",
+            duration_buf, "request_bytes", request_buf, "response_bytes", response_buf, NULL);
 }

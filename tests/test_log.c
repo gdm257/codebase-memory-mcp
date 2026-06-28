@@ -126,8 +126,8 @@ TEST(log_json_output) {
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
     cbm_log_set_level(CBM_LOG_INFO);
 
-    ASSERT(cbm_str_contains_raw(output, "\"severity\":\"INFO\""));
-    ASSERT(cbm_str_contains_raw(output, "\"message\":\"test.msg\""));
+    ASSERT(cbm_str_contains_raw(output, "\"level\":\"info\""));
+    ASSERT(cbm_str_contains_raw(output, "\"event\":\"test.msg\""));
     ASSERT(cbm_str_contains_raw(output, "\"key1\":\"val1\""));
     ASSERT(cbm_str_contains_raw(output, "\"key2\":\"line\\nbreak\""));
     PASS();
@@ -174,12 +174,13 @@ TEST(log_operational_helpers) {
     cbm_log_set_level(CBM_LOG_INFO);
 
     ASSERT(cbm_str_contains_raw(output, "msg=mcp.request"));
-    ASSERT(cbm_str_contains_raw(output, "rpc.method=tools/call"));
-    ASSERT(cbm_str_contains_raw(output, "mcp.tool.name=search_graph"));
+    ASSERT(cbm_str_contains_raw(output, "protocol=jsonrpc"));
+    ASSERT(cbm_str_contains_raw(output, "method=tools/call"));
+    ASSERT(cbm_str_contains_raw(output, "tool=search_graph"));
     ASSERT(cbm_str_contains_raw(output, "msg=http.request"));
-    ASSERT(cbm_str_contains_raw(output, "http.request.method=GET"));
-    ASSERT(cbm_str_contains_raw(output, "url.path=/api/layout"));
-    ASSERT(cbm_str_contains_raw(output, "http.response.status_code=200"));
+    ASSERT(cbm_str_contains_raw(output, "method=GET"));
+    ASSERT(cbm_str_contains_raw(output, "path=/api/layout"));
+    ASSERT(cbm_str_contains_raw(output, "status=200"));
     PASS();
 }
 
@@ -197,16 +198,16 @@ TEST(log_format_from_env) {
     PASS();
 }
 
-TEST(log_format_is_explicit_only) {
+TEST(log_format_unset_keeps_current) {
     cbm_unsetenv("CBM_LOG_FORMAT");
-    cbm_setenv("ENVIRONMENT", "production", 1);
-    cbm_setenv("K_SERVICE", "cbm", 1);
+    cbm_log_set_format(CBM_LOG_FORMAT_JSON);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_format(), CBM_LOG_FORMAT_JSON);
+
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
     cbm_log_init_from_env();
     ASSERT_EQ(cbm_log_get_format(), CBM_LOG_FORMAT_TEXT);
 
-    cbm_unsetenv("ENVIRONMENT");
-    cbm_unsetenv("K_SERVICE");
     PASS();
 }
 
@@ -294,7 +295,7 @@ SUITE(log) {
     RUN_TEST(log_sink_tee_keeps_stderr);
     RUN_TEST(log_operational_helpers);
     RUN_TEST(log_format_from_env);
-    RUN_TEST(log_format_is_explicit_only);
+    RUN_TEST(log_format_unset_keeps_current);
     RUN_TEST(log_level_from_env_textual);
     RUN_TEST(log_level_from_env_numeric);
     RUN_TEST(log_level_from_env_invalid_ignored);

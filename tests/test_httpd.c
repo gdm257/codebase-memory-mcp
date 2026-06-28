@@ -569,9 +569,9 @@ TEST(ui_server_access_log_redacts_query) {
 
     ASSERT_NOT_NULL(strstr(httpd_log_buf, "msg=http.request"));
     ASSERT_NOT_NULL(strstr(httpd_log_buf, "component=graph_ui"));
-    ASSERT_NOT_NULL(strstr(httpd_log_buf, "http.request.method=GET"));
-    ASSERT_NOT_NULL(strstr(httpd_log_buf, "url.path=/definitely/not/here"));
-    ASSERT_NOT_NULL(strstr(httpd_log_buf, "http.response.status_code=404"));
+    ASSERT_NOT_NULL(strstr(httpd_log_buf, "method=GET"));
+    ASSERT_NOT_NULL(strstr(httpd_log_buf, "path=/definitely/not/here"));
+    ASSERT_NOT_NULL(strstr(httpd_log_buf, "status=404"));
     ASSERT_NULL(strstr(httpd_log_buf, "token"));
     ASSERT_NULL(strstr(httpd_log_buf, "secret"));
     PASS();
