@@ -814,6 +814,115 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+/* Reproduce-first (#650, distilled): two GENUINELY-DIFFERENT same-named functions
+ * whose bodies differ in length score differently, so the old exact-tie check did
+ * not flag them ambiguous — and bfs_union_same_name (#546) then merged the caller
+ * sets of both into one confidently-conflated answer (the mirror of #546's under-
+ * report). The fix: 2+ real callable defs => ambiguous (disambiguate), never union
+ * distinct symbols. RED before the pick_resolved_node real_def_count rule (response
+ * merged callerA+callerB), GREEN after (response is ambiguous, no "callers"). */
+TEST(tool_trace_call_path_distinct_defs_not_over_unioned) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "ou-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/ou");
+    /* two unrelated real definitions of "dupreal", DIFFERENT body spans */
+    cbm_node_t da = {.project = proj, .label = "Function", .name = "dupreal",
+                     .qualified_name = "ou-proj.a.dupreal", .file_path = "a.c",
+                     .start_line = 10, .end_line = 20}; /* span 10 */
+    cbm_node_t db = {.project = proj, .label = "Function", .name = "dupreal",
+                     .qualified_name = "ou-proj.b.dupreal", .file_path = "b.c",
+                     .start_line = 10, .end_line = 40}; /* span 30 (no tie) */
+    cbm_node_t ca = {.project = proj, .label = "Function", .name = "callerA",
+                     .qualified_name = "ou-proj.a.callerA", .file_path = "a.c",
+                     .start_line = 30, .end_line = 40};
+    cbm_node_t cb = {.project = proj, .label = "Function", .name = "callerB",
+                     .qualified_name = "ou-proj.b.callerB", .file_path = "b.c",
+                     .start_line = 50, .end_line = 60};
+    int64_t id_da = cbm_store_upsert_node(st, &da);
+    int64_t id_db = cbm_store_upsert_node(st, &db);
+    int64_t id_ca = cbm_store_upsert_node(st, &ca);
+    int64_t id_cb = cbm_store_upsert_node(st, &cb);
+    ASSERT_GT(id_da, 0);
+    ASSERT_GT(id_db, 0);
+    ASSERT_GT(id_ca, 0);
+    ASSERT_GT(id_cb, 0);
+    cbm_edge_t ea = {.project = proj, .source_id = id_ca, .target_id = id_da, .type = "CALLS"};
+    cbm_edge_t eb = {.project = proj, .source_id = id_cb, .target_id = id_db, .type = "CALLS"};
+    cbm_store_insert_edge(st, &ea);
+    cbm_store_insert_edge(st, &eb);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"dupreal\","
+             "\"project\":\"ou-proj\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    /* distinct symbols must be disambiguated, not merged into one caller set */
+    ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
+    ASSERT_NOT_NULL(strstr(inner, "suggestions"));
+    ASSERT_NULL(strstr(inner, "\"callers\""));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Guard that the ambiguity gate does NOT regress the #546 fix: a real .ts
+ * implementation plus a body-less ambient .d.ts stub is ONE logical symbol
+ * (one real callable def + a fragment), so it must stay non-ambiguous and the
+ * caller sets from both nodes must be unioned. */
+TEST(tool_trace_call_path_dts_stub_unions_with_impl) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dts-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dts");
+    cbm_node_t impl = {.project = proj, .label = "Function", .name = "sym546",
+                       .qualified_name = "dts-proj.impl.sym546", .file_path = "src/sym.ts",
+                       .start_line = 10, .end_line = 30}; /* real body */
+    cbm_node_t stub = {.project = proj, .label = "Function", .name = "sym546",
+                       .qualified_name = "dts-proj.stub.sym546", .file_path = "types/sym.d.ts",
+                       .start_line = 5, .end_line = 5}; /* body-less ambient decl */
+    cbm_node_t crel = {.project = proj, .label = "Function", .name = "callerRel",
+                       .qualified_name = "dts-proj.callerRel", .file_path = "src/rel.ts",
+                       .start_line = 1, .end_line = 8};
+    cbm_node_t cali = {.project = proj, .label = "Function", .name = "callerAlias",
+                       .qualified_name = "dts-proj.callerAlias", .file_path = "src/ali.ts",
+                       .start_line = 1, .end_line = 8};
+    int64_t id_impl = cbm_store_upsert_node(st, &impl);
+    int64_t id_stub = cbm_store_upsert_node(st, &stub);
+    int64_t id_crel = cbm_store_upsert_node(st, &crel);
+    int64_t id_cali = cbm_store_upsert_node(st, &cali);
+    ASSERT_GT(id_impl, 0);
+    ASSERT_GT(id_stub, 0);
+    ASSERT_GT(id_crel, 0);
+    ASSERT_GT(id_cali, 0);
+    /* callers split by import style: relative -> impl, path-alias -> stub */
+    cbm_edge_t er = {.project = proj, .source_id = id_crel, .target_id = id_impl, .type = "CALLS"};
+    cbm_edge_t el = {.project = proj, .source_id = id_cali, .target_id = id_stub, .type = "CALLS"};
+    cbm_store_insert_edge(st, &er);
+    cbm_store_insert_edge(st, &el);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"sym546\","
+             "\"project\":\"dts-proj\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "ambiguous"));
+    /* union across impl + stub: BOTH callers appear (this is the #546 fix) */
+    ASSERT_NOT_NULL(strstr(inner, "callerRel"));
+    ASSERT_NOT_NULL(strstr(inner, "callerAlias"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -3122,6 +3231,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
+    RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);

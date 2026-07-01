@@ -2684,9 +2684,33 @@ static long node_resolution_score(const cbm_node_t *n) {
     return label_rank * (long)RES_LABEL_WEIGHT + span;
 }
 
-/* Pick the best-resolving node among name matches. Sets *ambiguous when the top
- * score is shared by more than one candidate (a genuine tie the caller must
- * disambiguate) so resolution never silently traces the wrong same-named node. */
+/* A "real" callable definition: a Function/Method node with a non-empty body
+ * span (end_line > start_line). A body-less node (start_line == end_line) is an
+ * ambient declaration / signature stub — e.g. a TypeScript `.d.ts` declaration
+ * — which is a *fragment* of one logical symbol, not a distinct definition. The
+ * distinction lets pick_resolved_node union a stub with its real implementation
+ * (#546) while still treating two genuinely-different same-named functions as
+ * ambiguous rather than conflating their caller sets. */
+static bool node_is_real_callable_def(const cbm_node_t *n) {
+    if (!n->label) {
+        return false;
+    }
+    if (strcmp(n->label, "Function") != 0 && strcmp(n->label, "Method") != 0) {
+        return false;
+    }
+    return (long)n->end_line - (long)n->start_line > 0;
+}
+
+/* Pick the best-resolving node among name matches. Sets *ambiguous when the
+ * matches can't be reduced to one logical symbol, so resolution never silently
+ * traces (or conflates) the wrong same-named node:
+ *   1. the top score is shared by >1 candidate (a genuine rank/span tie), or
+ *   2. two or more *real* callable definitions share the name — distinct
+ *      implementations, not a definition plus its body-less stub(s).
+ * Rule 2 completes rule 1: without it, two same-named functions whose bodies
+ * differ in length score differently, dodge the tie, and get their caller sets
+ * unioned by bfs_union_same_name (#546) into one confidently-conflated answer.
+ * Body-less .d.ts stubs still union with their implementation (#650). */
 static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguous) {
     *ambiguous = false;
     if (count <= 1) {
@@ -2702,10 +2726,17 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
         }
     }
     int top_count = 0;
+    int real_def_count = 0;
     for (int i = 0; i < count; i++) {
         if (node_resolution_score(&nodes[i]) == best_score) {
             top_count++;
         }
+        if (node_is_real_callable_def(&nodes[i])) {
+            real_def_count++;
+        }
+    }
+    if (real_def_count > 1) {
+        *ambiguous = true;
     }
     if (top_count > 1) {
         *ambiguous = true;
