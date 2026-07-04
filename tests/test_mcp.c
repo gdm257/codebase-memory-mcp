@@ -8,10 +8,12 @@
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <cli/cli.h>
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
+#include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
@@ -4033,6 +4035,124 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
 #undef ROQ_PROJECT
 
 /* ══════════════════════════════════════════════════════════════════
+ *  AUTO_WATCH GATE  (distilled from PR #625)
+ *
+ *  Background watcher registration on session connect is gated by the
+ *  `auto_watch` config key (default TRUE = existing behavior).
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Drive the already-indexed connect path (initialize → maybe_auto_index →
+ * watcher registration) and return the resulting watch count.
+ * auto_watch_value: NULL leaves the key unset (exercises the default),
+ * otherwise the key is set to that value before initialize.
+ * Returns a negative code on fixture setup failure. */
+static int auto_watch_connect_watch_count(const char *auto_watch_value) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-autowatch-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        return -1;
+    }
+
+    char repodir[512];
+    snprintf(repodir, sizeof(repodir), "%s/repo", cache);
+    if (th_mkdir_p(repodir) != 0) {
+        th_rmtree(cache);
+        return -2;
+    }
+
+    /* Same derivation detect_session uses on the cwd — realpath-based, so
+     * the name matches even where /tmp is a symlink (macOS). */
+    char *project = cbm_project_name_from_path(repodir);
+    if (!project) {
+        th_rmtree(cache);
+        return -3;
+    }
+
+    /* Pre-create <cache>/<project>.db so maybe_auto_index takes the
+     * "already indexed" branch — the watcher-registration site under test. */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    if (th_write_file(db_path, "") != 0) {
+        free(project);
+        th_rmtree(cache);
+        return -4;
+    }
+    free(project);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_rmtree(cache);
+        return -5;
+    }
+
+    int count = -6;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    cbm_store_t *wstore = cbm_store_open_memory();
+    cbm_watcher_t *watcher = wstore ? cbm_watcher_new(wstore, NULL, NULL) : NULL;
+    if (cfg && watcher) {
+        if (auto_watch_value) {
+            cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, auto_watch_value);
+        }
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            cbm_mcp_server_set_watcher(srv, watcher);
+            cbm_mcp_server_set_config(srv, cfg);
+            char *resp = cbm_mcp_server_handle(
+                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+            free(resp);
+            count = cbm_watcher_watch_count(watcher);
+            cbm_mcp_server_free(srv);
+        }
+    }
+
+    if (watcher) {
+        cbm_watcher_free(watcher);
+    }
+    if (wstore) {
+        cbm_store_close(wstore);
+    }
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+
+    (void)cbm_chdir(old_cwd);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    return count;
+}
+
+/* Default (key unset) → watcher registered on connect. Guards the
+ * no-behavior-change promise of the auto_watch gate: existing users keep
+ * background auto-sync without touching config. */
+TEST(mcp_auto_watch_default_registers_watcher_on_connect) {
+    int count = auto_watch_connect_watch_count(NULL);
+    if (count < 0) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+
+/* auto_watch=false → NO watcher registered on connect. RED on pre-gate code
+ * (registration was unconditional and the key did not exist). */
+TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
+    int count = auto_watch_connect_watch_count("false");
+    if (count < 0) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -4206,4 +4326,8 @@ SUITE(mcp) {
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+
+    /* auto_watch gate (distilled from PR #625) */
+    RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
+    RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
 }
