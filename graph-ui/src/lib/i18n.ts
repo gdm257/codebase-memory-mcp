@@ -23,6 +23,7 @@ export const messages = {
       selectedLabel: "Graph",
       search: "Search...",
       clearSelection: "Clear selection",
+      folders: "Folders",
     },
     projects: {
       indexedProjects: "Indexed Projects",
@@ -95,6 +96,7 @@ export const messages = {
       selectedLabel: "图谱",
       search: "搜索...",
       clearSelection: "清除选择",
+      folders: "目录",
     },
     projects: {
       indexedProjects: "已索引项目",

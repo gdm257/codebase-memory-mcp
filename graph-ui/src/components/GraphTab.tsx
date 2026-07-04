@@ -227,7 +227,7 @@ export function GraphTab({ project }: GraphTabProps) {
     return (
       <div className="flex items-center justify-center h-full">
         <p className="text-white/30 text-sm">
-          Select a project from the Stats tab
+          Select a project from the Projects tab
         </p>
       </div>
     );
@@ -366,7 +366,7 @@ export function GraphTab({ project }: GraphTabProps) {
                     setCameraTarget(null);
                   }}
                 >
-                  Clear
+                  Clear selection
                 </Button>
               )}
               <Button
