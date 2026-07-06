@@ -139,4 +139,92 @@ static inline void cbm_negmemo_insert(CBMNegMemo *m, CBMArena *arena, uint64_t k
     }
 }
 
+/* ── CBMIdxMemo: exact-match string-key → int index map ─────────────────────
+ * Companion for build-time registration loops that need "have I registered
+ * this QN, and at which index?" in O(1) — the registry's own buckets don't
+ * exist before finalize, and probing it linearly from inside the registration
+ * loop is the classic quadratic (kernel shared rust registry: ~63 s).
+ * Exact match: each slot stores the borrowed key pointer and verifies with
+ * strcmp, so hash collisions can't map to a wrong index. First-put wins. */
+typedef struct {
+    struct cbm_idxmemo_slot {
+        uint64_t h; /* 0 = empty */
+        const char *key;
+        int32_t val;
+    } *slots;
+    int cap; /* power of two */
+    int count;
+} CBMIdxMemo;
+
+static inline int32_t cbm_idxmemo_get(const CBMIdxMemo *m, const char *key) {
+    if (!m->slots || !key || m->count == 0) {
+        return -1;
+    }
+    uint64_t h = cbm_negmemo_key(0, key, NULL);
+    uint64_t mask = (uint64_t)(m->cap - 1);
+    for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+        if (m->slots[i].h == 0) {
+            return -1;
+        }
+        if (m->slots[i].h == h && m->slots[i].key && strcmp(m->slots[i].key, key) == 0) {
+            return m->slots[i].val;
+        }
+    }
+}
+
+static inline void cbm_idxmemo_put_raw(struct cbm_idxmemo_slot *slots, int cap, uint64_t h,
+                                       const char *key, int32_t val) {
+    uint64_t mask = (uint64_t)(cap - 1);
+    for (uint64_t i = h & mask;; i = (i + 1) & mask) {
+        if (slots[i].h == 0) {
+            slots[i].h = h;
+            slots[i].key = key;
+            slots[i].val = val;
+            return;
+        }
+        if (slots[i].h == h && slots[i].key && strcmp(slots[i].key, key) == 0) {
+            return; /* first-put wins */
+        }
+    }
+}
+
+static inline void cbm_idxmemo_put_if_absent(CBMIdxMemo *m, CBMArena *arena, const char *key,
+                                             int32_t val) {
+    if (!arena || !key) {
+        return;
+    }
+    if (!m->slots) {
+        m->slots = cbm_arena_alloc(arena,
+                                   sizeof(struct cbm_idxmemo_slot) * CBM_NEGMEMO_INIT_CAP);
+        if (!m->slots) {
+            return;
+        }
+        memset(m->slots, 0, sizeof(struct cbm_idxmemo_slot) * CBM_NEGMEMO_INIT_CAP);
+        m->cap = CBM_NEGMEMO_INIT_CAP;
+        m->count = 0;
+    }
+    if ((int64_t)(m->count + 1) * CBM_NEGMEMO_LOAD_DEN >=
+        (int64_t)m->cap * CBM_NEGMEMO_LOAD_NUM) {
+        int new_cap = m->cap * CBM_NEGMEMO_GROW;
+        struct cbm_idxmemo_slot *ns =
+            cbm_arena_alloc(arena, sizeof(struct cbm_idxmemo_slot) * (size_t)new_cap);
+        if (!ns) {
+            return;
+        }
+        memset(ns, 0, sizeof(struct cbm_idxmemo_slot) * (size_t)new_cap);
+        for (int i = 0; i < m->cap; i++) {
+            if (m->slots[i].h) {
+                cbm_idxmemo_put_raw(ns, new_cap, m->slots[i].h, m->slots[i].key, m->slots[i].val);
+            }
+        }
+        m->slots = ns;
+        m->cap = new_cap;
+    }
+    uint64_t h = cbm_negmemo_key(0, key, NULL);
+    if (cbm_idxmemo_get(m, key) < 0) {
+        cbm_idxmemo_put_raw(m->slots, m->cap, h, key, val);
+        m->count++;
+    }
+}
+
 #endif /* CBM_LSP_NEG_MEMO_H */

@@ -29,6 +29,7 @@
 #include "rust_cargo.h"
 #include "../helpers.h"
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3159,6 +3160,20 @@ static void rust_expand_user_macro(RustLSPContext *ctx, const char *mname, TSNod
     if (!substituted)
         return;
 
+    /* Expansion memo (see RustLSPContext.macro_memo): reset per top-level
+     * invocation, dedup identical (macro, substituted body) within the
+     * recursion chain — kills the exponential breadth of self-recursive
+     * macro_rules without losing any distinctly-attributed source site. */
+    if (ctx->macro_expand_depth == 0 && ctx->macro_memo.slots) {
+        memset(ctx->macro_memo.slots, 0, sizeof(uint64_t) * (size_t)ctx->macro_memo.cap);
+        ctx->macro_memo.count = 0;
+    }
+    uint64_t mm_key = cbm_negmemo_key(3, mname, substituted);
+    if (cbm_negmemo_contains(&ctx->macro_memo, mm_key)) {
+        return;
+    }
+    cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, mm_key);
+
     /* Wrap and parse. */
     char *wrapped = cbm_arena_sprintf(ctx->arena, "fn __cbm_macro_expand() { %s; }\n", substituted);
     if (!wrapped)
@@ -3238,6 +3253,20 @@ static void rust_resolve_macro_arg_exprs(RustLSPContext *ctx, TSNode invocation)
     char *arg_text = cbm_arena_strndup(ctx->arena, inner, (size_t)inner_len);
     if (!arg_text)
         return;
+
+    /* Same expansion memo as rust_expand_user_macro (site tag 4), but ONLY
+     * inside a recursion chain (depth > 0): there the identical argument text
+     * is re-parsed on every re-expansion of a self-recursive macro and has no
+     * distinct source site. Top-level invocations (depth 0) always parse —
+     * identical args in different enclosing functions attribute differently
+     * and must all be walked. */
+    if (ctx->macro_expand_depth > 0) {
+        uint64_t am_key = cbm_negmemo_key(4, arg_text, NULL);
+        if (cbm_negmemo_contains(&ctx->macro_memo, am_key)) {
+            return;
+        }
+        cbm_negmemo_insert(&ctx->macro_memo, ctx->arena, am_key);
+    }
 
     /* Wrap the comma-separated arguments in a tuple expression so the whole
      * thing parses as one valid expression (a trailing format-spec arg like
@@ -5342,6 +5371,24 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
     cbm_registry_init(reg, arena);
     cbm_rust_stdlib_register(reg, arena);
 
+    /* qn → (type index + 1), FIRST occurrence wins (mirrors the linear scans
+     * this map replaces). Both in-loop registry probes below — the receiver
+     * auto-registration check and the trait-linkage lookup — used to scan the
+     * UNFINALIZED registry linearly (no buckets exist before finalize): the
+     * checklist's lookup-in-registration-loop pattern. Invisible on small
+     * per-file builds; on the shared all_defs build (~1.4M entries) those
+     * scans were a constant ~63 s of the kernel run — and the sibling
+     * null-filter files waited on the build once-guard for exactly that long,
+     * which is why no resolution-side fix ever moved their wall time. Index,
+     * not pointer, because reg->types reallocs as it grows. */
+    CBMIdxMemo type_idx = {0};
+    for (int ti = 0; ti < reg->type_count; ti++) {
+        const char *qn = reg->types[ti].qualified_name;
+        if (qn) {
+            cbm_idxmemo_put_if_absent(&type_idx, arena, qn, ti);
+        }
+    }
+
     for (int i = 0; i < def_count; i++) {
         CBMRustLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label)
@@ -5358,6 +5405,7 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             rt.is_interface = d->is_interface || strcmp(d->label, "Trait") == 0 ||
                               strcmp(d->label, "Interface") == 0;
             cbm_registry_add_type(reg, rt);
+            cbm_idxmemo_put_if_absent(&type_idx, arena, rt.qualified_name, reg->type_count - 1);
         }
 
         if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
@@ -5398,13 +5446,15 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
 
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
                 rf.receiver_type = cbm_arena_strdup(arena, d->receiver_type);
-                if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+                if (cbm_idxmemo_get(&type_idx, rf.receiver_type) < 0) {
                     CBMRegisteredType auto_t;
                     memset(&auto_t, 0, sizeof(auto_t));
                     auto_t.qualified_name = rf.receiver_type;
                     const char *dot = strrchr(d->receiver_type, '.');
                     auto_t.short_name = dot ? cbm_arena_strdup(arena, dot + 1) : rf.receiver_type;
                     cbm_registry_add_type(reg, auto_t);
+                    cbm_idxmemo_put_if_absent(&type_idx, arena, auto_t.qualified_name,
+                                              reg->type_count - 1);
                 }
             }
 
@@ -5413,12 +5463,9 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             /* If trait_qn set: encode embedded_type linkage on receiver. */
             if (rf.receiver_type && d->trait_qn && d->trait_qn[0]) {
                 CBMRegisteredType *rt = NULL;
-                for (int ti = 0; ti < reg->type_count; ti++) {
-                    if (reg->types[ti].qualified_name &&
-                        strcmp(reg->types[ti].qualified_name, rf.receiver_type) == 0) {
-                        rt = &reg->types[ti];
-                        break;
-                    }
+                int32_t tix = cbm_idxmemo_get(&type_idx, rf.receiver_type);
+                if (tix >= 0) {
+                    rt = &reg->types[tix];
                 }
                 if (rt) {
                     int existing = 0;
@@ -5437,7 +5484,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         }
     }
 
-    /* Finalise the cross-file registry now that all defs are added. */
+    /* Finalise the cross-file registry now that all defs are added.
+     * (type_idx is arena-owned — freed with the registry's arena.) */
     cbm_registry_finalize(reg);
 }
 

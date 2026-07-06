@@ -174,6 +174,18 @@ typedef struct {
 
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;
+
+    /* Per-ROOT-invocation macro-expansion memo. Kernel macro_rules are often
+     * self-recursive (define_sizes! re-invokes itself with @internal/@impls
+     * args) and the expansion fallback ("no pattern matched — still expand the
+     * first rule") makes that recursion non-convergent: with an unbounded
+     * BREADTH under the depth-8 guard, 2-44 source invocations exploded into
+     * ~200k expansions (each a full tree-sitter parse) ≈ 63 s per file.
+     * Within one expansion chain an identical (macro, substituted body) is
+     * walked once — identical text implies an identical walk, and recursive
+     * re-invocations have no distinct source site to attribute. Reset at each
+     * top-level invocation so distinct source sites keep their attribution. */
+    CBMNegMemo macro_memo;
 } RustLSPContext;
 
 /* Initialise an empty context for processing one file. */
