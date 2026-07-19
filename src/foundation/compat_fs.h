@@ -61,6 +61,10 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz);
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
+/* Delete a file or directory tree without following symlinks. Missing paths
+ * are treated as success. */
+bool cbm_remove_tree(const char *path);
+
 /* Open a file by UTF-8 path.
  * On Windows, converts to wide-char and calls _wfopen so paths with
  * non-ASCII characters (accents, CJK, etc.) are handled correctly.

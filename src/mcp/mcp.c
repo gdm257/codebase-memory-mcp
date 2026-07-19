@@ -40,6 +40,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
+#include "git/git_url.h"
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
@@ -1273,8 +1274,42 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
     return repo_path;
 }
 
+/* The raw (pre-normalization) value of the project argument across its
+ * accepted alias keys (project / project_name / project_id / projectName).
+ * Caller frees. */
+static char *raw_project_arg(const char *args_json) {
+    char *p = cbm_mcp_get_string_arg(args_json, "project");
+    if (!p) {
+        p = cbm_mcp_get_string_arg(args_json, "project_name");
+    }
+    if (!p) {
+        p = cbm_mcp_get_string_arg(args_json, "project_id");
+    }
+    if (!p) {
+        p = cbm_mcp_get_string_arg(args_json, "projectName");
+    }
+    return p;
+}
+
 static char *normalize_project_arg(char *project) {
-    if (!project || (!strchr(project, '/') && !strchr(project, '\\'))) {
+    if (!project) {
+        return project;
+    }
+    /* A remote git URL maps to its own project name (host__path[__ref]) so
+     * that index_repository and search_code converge on one DB. cbm_git_url
+     * uses '/' → "__" rather than the '-' cbm_project_name_from_path would
+     * produce, keeping "o/r" and "o-r" distinct. */
+    if (cbm_git_url_is_url(project)) {
+        cbm_git_url_t u;
+        if (cbm_git_url_normalize(project, &u) == 0) {
+            char *name = heap_strdup(u.project_name);
+            cbm_git_url_free(&u);
+            free(project);
+            return name;
+        }
+        return project;
+    }
+    if (!strchr(project, '/') && !strchr(project, '\\')) {
         return project;
     }
 
@@ -1779,19 +1814,69 @@ static char *build_missing_project_error(void) {
                        "list_projects to see indexed projects.\"}");
 }
 
-/* Pick the right no-store error: a NULL project means the argument was missing
- * (clearer message); a non-NULL project that didn't resolve means it's
- * unknown/unindexed (list the available ones). */
-static char *build_no_store_error(const char *project) {
-    return project ? build_project_list_error("project not found or not indexed")
-                   : build_missing_project_error();
+/* Build the "index this URL first" error for an unindexed git URL project.
+ * Emits a copy-pasteable index_repository call body in `hint` — the LLM should
+ * spot it and close the loop without a second turn. Caller must free(). */
+static char *build_unindexed_url_error(const char *raw_url) {
+    cbm_git_url_t u;
+    char *project = NULL;
+    if (cbm_git_url_normalize(raw_url, &u) == 0) {
+        project = heap_strdup(u.project_name);
+        cbm_git_url_free(&u);
+    }
+    char url_escaped[CBM_SZ_1K];
+    cbm_json_escape(url_escaped, sizeof(url_escaped), raw_url);
+
+    enum { ERR_BUF_SZ = 5120 };
+    char buf[ERR_BUF_SZ];
+    if (project) {
+        snprintf(buf, sizeof(buf),
+                 "{\"error\":\"project for URL has not been indexed\","
+                 " \"url\":\"%s\", \"project\":\"%s\","
+                 " \"hint\":\"project \\\"%s\\\" has not been indexed — call "
+                 "{\\\"tool\\\":\\\"index_repository\\\",\\\"arguments\\\":"
+                 "{\\\"repo_path\\\":\\\"%s\\\"}} first, then retry this tool.\"}",
+                 url_escaped, project, project, url_escaped);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "{\"error\":\"project for URL has not been indexed\","
+                 " \"url\":\"%s\","
+                 " \"hint\":\"URL \\\"%s\\\" has not been indexed — call "
+                 "{\\\"tool\\\":\\\"index_repository\\\",\\\"arguments\\\":"
+                 "{\\\"repo_path\\\":\\\"%s\\\"}} first, then retry this tool.\"}",
+                 url_escaped, url_escaped, url_escaped);
+    }
+    free(project);
+    return heap_strdup(buf);
 }
 
-/* Bail with the right error when no store is available. */
-#define REQUIRE_STORE(store, project)                     \
+/* Pick the right no-store error: a NULL project means the argument was missing
+ * (clearer message); a non-NULL project that didn't resolve means it's
+ * unknown/unindexed. When the raw argument was a git URL, point directly at an
+ * index_repository call instead of listing projects — the LLM can copy-paste
+ * the hint to close the loop (#1143). */
+static char *build_no_store_error(const char *project, const char *args) {
+    if (!project) {
+        return build_missing_project_error();
+    }
+    char *raw = args ? raw_project_arg(args) : NULL;
+    char *err = NULL;
+    if (raw && cbm_git_url_is_url(raw)) {
+        err = build_unindexed_url_error(raw);
+    } else {
+        err = build_project_list_error("project not found or not indexed");
+    }
+    free(raw);
+    return err;
+}
+
+/* Bail with the right error when no store is available. `args` is the raw
+ * handler argument JSON — used to detect a URL project and emit the stronger
+ * "call index_repository first" hint. May be NULL (non-URL fallback). */
+#define REQUIRE_STORE(store, project, args)               \
     do {                                                  \
         if (!(store)) {                                   \
-            char *_err = build_no_store_error(project);   \
+            char *_err = build_no_store_error(project, args); \
             char *_res = cbm_mcp_text_result(_err, true); \
             free(_err);                                   \
             free(project);                                \
@@ -2062,7 +2147,7 @@ static bool sg_field_blocked(const char *f); /* internal-only fields, defined wi
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    REQUIRE_STORE(store, project, args);
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
@@ -2956,7 +3041,7 @@ static void emit_semantic_results_toon(cbm_sb_t *sb, const cbm_vector_result_t *
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    REQUIRE_STORE(store, project, args);
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
@@ -3232,7 +3317,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("project is required when graph=\"missed\"", true);
     }
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_no_store_error(project, args);
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(project);
@@ -3679,7 +3764,7 @@ static const char *coverage_recommended_action(const char *status, const char *f
 static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    REQUIRE_STORE(store, project, args);
 
     yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
     yyjson_val *aroot = adoc ? yyjson_doc_get_root(adoc) : NULL;
@@ -3869,7 +3954,7 @@ static char *handle_check_index_coverage(cbm_mcp_server_t *srv, const char *args
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    REQUIRE_STORE(store, project, args);
     /* The git context block (worktree/shadow path variants) only matters when
      * debugging index-location issues — gate it so the common status call
      * stays lean. */
@@ -4433,7 +4518,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *scope_path = cbm_mcp_get_string_arg(args, "path");
     cbm_store_t *store = resolve_store(srv, project);
-    REQUIRE_STORE(store, project);
+    REQUIRE_STORE(store, project, args);
 
     char *not_indexed = verify_project_indexed(store, project);
     if (not_indexed) {
@@ -5652,7 +5737,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("function_name is required", true);
     }
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_no_store_error(project, args);
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(func_name);
@@ -6866,6 +6951,31 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("repo_path is required", true);
     }
 
+    /* Remote git URL: clone (or refresh) into the cache and index the local
+     * working tree, pinning the project name to the normalized host/path so
+     * the same URL searched later resolves to this DB. */
+    if (cbm_git_url_is_url(repo_path)) {
+        cbm_git_url_t gurl;
+        if (cbm_git_url_normalize(repo_path, &gurl) != 0) {
+            free(mode_str);
+            free(name_override);
+            free(repo_path);
+            return cbm_mcp_text_result("invalid git URL in repo_path", true);
+        }
+        if (cbm_git_url_ensure_cloned(&gurl) != 0) {
+            cbm_git_url_free(&gurl);
+            free(mode_str);
+            free(name_override);
+            free(repo_path);
+            return cbm_mcp_text_result("git clone failed for repo_path URL", true);
+        }
+        free(name_override);
+        name_override = heap_strdup(gurl.project_name);
+        free(repo_path);
+        repo_path = heap_strdup(gurl.clone_dir);
+        cbm_git_url_free(&gurl);
+    }
+
     repo_path = canonicalize_repo_path_if_exists(repo_path);
 
     /* Optional workspace boundary: when CBM_ALLOWED_ROOT is set (agentic /
@@ -7370,7 +7480,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = build_no_store_error(project, args);
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(qn);
@@ -8317,14 +8427,31 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
-    char *root_path = get_project_root(srv, project);
+    char *root_path = NULL;
+    {
+        /* Remote git URL project: clone on first use only (Y — search never
+         * refreshes an existing clone) and search the cached working tree.
+         * Falls through to the normal DB-backed root for a plain name. */
+        char *raw = raw_project_arg(args);
+        cbm_git_url_t gurl;
+        if (raw && cbm_git_url_is_url(raw) && cbm_git_url_normalize(raw, &gurl) == 0) {
+            if (cbm_git_url_cache_is_valid(&gurl) || cbm_git_url_ensure_cloned(&gurl) == 0) {
+                root_path = heap_strdup(gurl.clone_dir);
+            }
+            cbm_git_url_free(&gurl);
+        }
+        free(raw);
+    }
     if (!root_path) {
+        root_path = get_project_root(srv, project);
+    }
+    if (!root_path) {
+        char *_err = build_no_store_error(project, args);
+        char *_res = cbm_mcp_text_result(_err, true);
+        free(_err);
         free(pattern);
         free(project);
         free(file_pattern);
-        char *_err = build_project_list_error("project not found or not indexed");
-        char *_res = cbm_mcp_text_result(_err, true);
-        free(_err);
         return _res;
     }
 
@@ -8718,7 +8845,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
-        char *err = build_no_store_error(project);
+        char *err = build_no_store_error(project, args);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
@@ -9139,7 +9266,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
      * the UI are visible to each other (#256). */
     cbm_store_t *resolved = resolve_store(srv, project);
     if (!resolved) {
-        char *err = build_no_store_error(project);
+        char *err = build_no_store_error(project, args);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
@@ -9161,7 +9288,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if (resolved_db_path) {
         owned_rw = cbm_store_open_path(resolved_db_path);
         if (!owned_rw) {
-            char *err = build_no_store_error(project);
+            char *err = build_no_store_error(project, args);
             char *res = cbm_mcp_text_result(err, true);
             free(err);
             free(project);

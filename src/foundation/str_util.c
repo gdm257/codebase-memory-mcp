@@ -283,10 +283,12 @@ bool cbm_validate_project_name(const char *name) {
     /* Reject leading dot (hidden files / relative refs) */
     if (name[0] == '.')
         return false;
-    /* Allow only alphanumeric, dash, underscore, dot */
+    /* Allow only alphanumeric, dash, underscore, dot, and '@' (URL-style
+     * `host@ref` forms that pass through normalize_project_arg unescaped). */
     for (const char *p = name; *p; p++) {
         if (!(((*p >= 'a') && (*p <= 'z')) || ((*p >= 'A') && (*p <= 'Z')) ||
-              ((*p >= '0') && (*p <= '9')) || *p == '-' || *p == '_' || *p == '.')) {
+              ((*p >= '0') && (*p <= '9')) || *p == '-' || *p == '_' || *p == '.' ||
+              *p == '@')) {
             return false;
         }
     }

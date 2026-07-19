@@ -239,7 +239,7 @@ TRACES_SRCS = src/traces/traces.c
 WATCHER_SRCS = src/watcher/watcher.c
 
 # Git context module (new)
-GIT_SRCS = src/git/git_context.c
+GIT_SRCS = src/git/git_context.c src/git/git_url.c
 
 # CLI module (new)
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
@@ -353,6 +353,7 @@ TEST_DISCOVER_SRCS = \
     tests/test_userconfig.c \
     tests/test_gitignore.c \
     tests/test_git_context.c \
+    tests/test_git_url.c \
     tests/test_discover.c
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c

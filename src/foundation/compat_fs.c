@@ -891,3 +891,93 @@ void cbm_remove_db_sidecars(const char *db_path) {
         (void)cbm_unlink(side);
     }
 }
+
+enum {
+    CBM_PATH_MISSING = 0,
+    CBM_PATH_FILE = 1,
+    CBM_PATH_DIR = 2,
+    CBM_PATH_LINK = 3,
+    CBM_PATH_ERROR = -1,
+};
+
+static int cbm_path_kind_no_follow(const char *path) {
+#ifdef _WIN32
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return CBM_PATH_ERROR;
+    }
+    DWORD attrs = GetFileAttributesW(wpath);
+    DWORD error = attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+    free(wpath);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? CBM_PATH_MISSING
+                                                                                : CBM_PATH_ERROR;
+    }
+    if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+        return CBM_PATH_LINK;
+    }
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0U ? CBM_PATH_DIR : CBM_PATH_FILE;
+#else
+    struct stat state;
+    if (lstat(path, &state) != 0) {
+        return errno == ENOENT ? CBM_PATH_MISSING : CBM_PATH_ERROR;
+    }
+    if (S_ISLNK(state.st_mode)) {
+        return CBM_PATH_LINK;
+    }
+    return S_ISDIR(state.st_mode) ? CBM_PATH_DIR : CBM_PATH_FILE;
+#endif
+}
+
+static bool cbm_remove_tree_impl(const char *path) {
+    int kind = cbm_path_kind_no_follow(path);
+    if (kind == CBM_PATH_MISSING) {
+        return true;
+    }
+    if (kind == CBM_PATH_ERROR) {
+        return false;
+    }
+    if (kind != CBM_PATH_DIR) {
+        return cbm_unlink(path) == 0 || cbm_rmdir(path) == 0;
+    }
+
+    cbm_dir_t *dir = cbm_opendir(path);
+    if (!dir) {
+        return false;
+    }
+    bool ok = true;
+    size_t path_len = strlen(path);
+    while (ok) {
+        cbm_dirent_t *entry = cbm_readdir(dir);
+        if (!entry) {
+            break;
+        }
+        size_t name_len = strlen(entry->name);
+        bool has_separator = path_len > 0 &&
+                             (path[path_len - 1] == '/' || path[path_len - 1] == '\\');
+        size_t child_len = path_len + (has_separator ? 0U : 1U) + name_len + 1U;
+        char *child = (char *)malloc(child_len);
+        if (!child) {
+            ok = false;
+            break;
+        }
+        int written = snprintf(child, child_len, "%s%s%s", path, has_separator ? "" : "/",
+                               entry->name);
+        if (written < 0 || (size_t)written >= child_len) {
+            free(child);
+            ok = false;
+            break;
+        }
+        ok = cbm_remove_tree_impl(child);
+        free(child);
+    }
+    cbm_closedir(dir);
+    if (ok && cbm_rmdir(path) != 0) {
+        ok = false;
+    }
+    return ok;
+}
+
+bool cbm_remove_tree(const char *path) {
+    return path && path[0] ? cbm_remove_tree_impl(path) : false;
+}
